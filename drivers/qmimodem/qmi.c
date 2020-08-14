@@ -32,6 +32,9 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/qrtr.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
 #include <glib.h>
 
@@ -46,11 +49,14 @@ typedef void (*qmi_message_func_t)(uint16_t message, uint16_t length,
 struct discovery {
 	qmi_destroy_func_t destroy;
 };
+struct discover_data;
 
 struct qmi_version {
 	uint8_t type;
 	uint16_t major;
 	uint16_t minor;
+	uint16_t node;
+	uint16_t port;
 	const char *name;
 };
 
@@ -58,6 +64,10 @@ struct qmi_device {
 	int ref_count;
 	int fd;
 	GIOChannel *io;
+	GSocket *socket;
+	GSource *source;
+	unsigned int next_cid;
+	unsigned int node_id;
 	bool close_on_unref;
 	guint read_watch;
 	guint write_watch;
@@ -87,6 +97,7 @@ struct qmi_device {
 struct qmi_service {
 	int ref_count;
 	struct qmi_device *device;
+	int port;
 	uint8_t type;
 	uint16_t major;
 	uint16_t minor;
@@ -159,6 +170,12 @@ struct qmi_tlv_hdr {
 	uint8_t value[0];
 } __attribute__ ((packed));
 #define QMI_TLV_HDR_SIZE 3
+
+struct qrtr_service_create_data {
+	struct qmi_service *service;
+	qmi_create_func_t func;
+	void *user_data;
+};
 
 void qmi_free(void *ptr)
 {
@@ -697,6 +714,256 @@ static void wakeup_writer(struct qmi_device *device)
 				can_write_data, device, write_watch_destroy);
 }
 
+#define CALC_SZ(count) ((count + 31) / 32)
+static gboolean qrtr_handle_ctrl_packet(struct qmi_device *device,
+				     char *buf, int len)
+{
+	struct qrtr_ctrl_pkt* ctrl_pkt = (struct qrtr_ctrl_pkt*) buf;
+	struct qmi_version *version;
+	int32_t type;
+	int32_t new_count;
+	const char *name;
+	int i;
+	DBG ("");
+
+	if (len < sizeof(*ctrl_pkt))
+		return TRUE;
+
+	type = GUINT32_FROM_LE (ctrl_pkt->cmd);
+
+	if (GUINT32_FROM_LE(ctrl_pkt->server.node) != device->node_id)
+		return TRUE;
+
+	switch (type) {
+	case QRTR_TYPE_NEW_SERVER:
+		new_count = device->version_count + 1;
+		if (CALC_SZ(new_count) > CALC_SZ(device->version_count)) {
+			device->version_list = g_realloc(device->version_list,
+					CALC_SZ(new_count) * 32 * sizeof(device->version_list[0]));
+
+		}
+		version = &device->version_list[new_count - 1];
+		version->type = GUINT32_FROM_LE (ctrl_pkt->server.service);
+		version->node = GUINT32_FROM_LE (ctrl_pkt->server.node);
+		version->port = GUINT32_FROM_LE (ctrl_pkt->server.port);
+		version->major = GUINT32_FROM_LE (ctrl_pkt->server.instance) & 0xff;
+		version->minor = GUINT32_FROM_LE (ctrl_pkt->server.instance) >> 8;
+
+		name = __service_type_to_string(version->type);
+
+		__debug_device(device, "found service [%d (%s) %d.%d]",
+				version->type, name ?: "unknown",
+				version->major, version->minor);
+		version->name = name;
+		break;
+	case QRTR_TYPE_DEL_SERVER:
+		new_count = device->version_count - 1;
+		if (new_count < 0)
+			return TRUE;
+
+		for (i = 0; i < new_count; i++) {
+			if (device->version_list[i].node != GUINT32_FROM_LE (ctrl_pkt->server.node) ||
+			    device->version_list[i].port != GUINT32_FROM_LE (ctrl_pkt->server.port))
+				continue;
+			for (; i < new_count; i++)
+				device->version_list[i] = device->version_list[i+1];
+			break;
+		}
+		break;
+	default:
+		return TRUE;
+	}
+
+	device->version_count = new_count;
+	return TRUE;
+}
+
+bool qrtr_send_packet(GSocket *socket,
+		unsigned int node,
+		unsigned int port,
+		char *buf, size_t buf_len)
+{
+	struct sockaddr_qrtr addr;
+	socklen_t len = sizeof (addr);
+	int ret, fd;
+	DBG ("node=%u port=%u len=%lu", node, port, buf_len);
+
+	fd = g_socket_get_fd (socket);
+
+	if (port == QRTR_PORT_CTRL) {
+		ret = getsockname (fd, (struct sockaddr *)&addr, &len);
+		if (ret < 0)
+			return false;
+	} else {
+		addr.sq_node = node;
+	}
+	addr.sq_family = AF_QIPCRTR;
+	addr.sq_port = port;
+
+	ret = sendto (fd, buf, buf_len, 0, (struct sockaddr *) &addr, sizeof (addr));
+	if (ret < 0)
+		return false;
+
+	return true;
+}
+
+bool qrtr_send_lookup(GSocket *socket)
+{
+	struct qrtr_ctrl_pkt ctrl_pkt = { 0 };
+	DBG ("");
+
+	ctrl_pkt.cmd = GUINT32_TO_LE (QRTR_TYPE_NEW_LOOKUP);
+
+	return qrtr_send_packet(socket, 0, QRTR_PORT_CTRL,
+			(char*) &ctrl_pkt, sizeof (ctrl_pkt));
+}
+
+static void qrtr_request_submit(struct qmi_device *device,
+				struct qmi_request *req)
+{
+	struct qmi_mux_hdr *hdr = req->buf;
+	GHashTableIter iter;
+	gpointer key, value;
+	int port = -1;
+	DBG ("");
+
+	g_hash_table_iter_init (&iter, device->service_list);
+	while (g_hash_table_iter_next (&iter, &key, &value))
+	{
+		struct qmi_service *svc = value;
+		if (svc->type != hdr->service)
+			continue;
+
+		port = svc->port;
+		break;
+	}
+
+	if (port < 0)
+		return;
+
+	g_assert(req->len > QMI_MUX_HDR_SIZE);
+
+	if(!qrtr_send_packet(device->socket,
+			device->node_id,
+			port,
+			(char*)req->buf + QMI_MUX_HDR_SIZE,
+			req->len - QMI_MUX_HDR_SIZE))
+		DBG("Failed to send request");
+
+	__hexdump('>', req->buf, req->len,
+				device->debug_func, device->debug_data);
+
+	__debug_msg(' ', req->buf, req->len,
+				device->debug_func, device->debug_data);
+
+	g_queue_push_tail(device->service_queue, req);
+}
+
+GSocket* qrtr_socket_create(GSourceFunc input_callback,
+				void *userdata, GSource **source)
+{
+	GSocket* gsocket;
+	int fd;
+	DBG ("");
+
+	if (!source)
+		return NULL;
+
+	fd = socket(AF_QIPCRTR, SOCK_DGRAM, 0);
+
+	gsocket = g_socket_new_from_fd (fd, NULL);
+	if (!gsocket) {
+		close (fd);
+		return NULL;
+	}
+
+	g_socket_set_timeout (gsocket, 0);
+
+	*source = g_socket_create_source (gsocket, G_IO_IN, NULL);
+	g_source_set_callback (*source,
+                           input_callback,
+                           userdata,
+                           NULL);
+
+	g_source_attach (*source, g_main_context_get_thread_default ());
+
+	return gsocket;
+}
+
+static gboolean qrtr_service_create_callback(gpointer callback_data)
+{
+	struct qrtr_service_create_data *data =
+		(struct qrtr_service_create_data*) callback_data;
+	DBG ("");
+
+	data->func(data->service, data->user_data);
+	qmi_service_unref(data->service);
+	g_free(data);
+	return FALSE;
+}
+
+static bool qrtr_service_create(struct qmi_device *device,
+				uint8_t type, qmi_create_func_t func,
+				void *user_data, qmi_destroy_func_t destroy)
+{
+	struct qmi_version *svc_version = NULL;
+	struct qmi_service *service = NULL;
+	struct qrtr_service_create_data *data = NULL;
+	unsigned int hash_id;
+	int i;
+	DBG ("%d", type);
+
+	if (!device->version_list)
+		return false;
+
+	__debug_device(device, "service create [type=%d]", type);
+
+	for (i = 0; i < device->version_count; i++)
+		if (device->version_list[i].type == type) {
+			svc_version = &device->version_list[i];
+			break;
+		}
+
+	if (!svc_version)
+		return false;
+
+	service = g_try_new0(struct qmi_service, 1);
+	if (!service)
+		return false;
+
+	service->ref_count = 1;
+	service->device = device;
+	service->type = type;
+	service->major = svc_version->major;
+	service->minor = svc_version->minor;
+	service->port = svc_version->port;
+	service->client_id = device->next_cid++;
+
+	data = g_try_new0(struct qrtr_service_create_data, 1);
+	if (!data) {
+		g_free(service);
+		return false;
+	}
+
+	data->service = service;
+	data->func = func;
+	data->user_data = user_data;
+
+	__debug_device(device, "service created [client=%d,type=%d,port=%u]",
+					service->client_id, service->type,
+					service->port);
+
+	hash_id = service->type | (service->client_id << 8);
+
+	g_hash_table_replace(device->service_list,
+				GUINT_TO_POINTER(hash_id), service);
+
+
+	g_timeout_add_seconds(0, qrtr_service_create_callback, data);
+
+	return true;
+}
+
 static uint16_t __request_submit(struct qmi_device *device,
 				struct qmi_request *req)
 {
@@ -706,6 +973,8 @@ static uint16_t __request_submit(struct qmi_device *device,
 
 	if (mux->service == QMI_SERVICE_CONTROL) {
 		struct qmi_control_hdr *hdr;
+
+		g_assert (!device->socket);
 
 		hdr = req->buf + QMI_MUX_HDR_SIZE;
 		hdr->type = 0x00;
@@ -721,6 +990,11 @@ static uint16_t __request_submit(struct qmi_device *device,
 		if (device->next_service_tid < 256)
 			device->next_service_tid = 256;
 		req->tid = hdr->transaction;
+	}
+
+	if (device->socket) {
+		qrtr_request_submit(device, req);
+		return req->tid;
 	}
 
 	g_queue_push_tail(device->req_queue, req);
@@ -953,6 +1227,7 @@ struct qmi_device *qmi_device_new(int fd)
 
 	device->fd = fd;
 	device->close_on_unref = false;
+	device->socket = NULL;
 
 	flags = fcntl(device->fd, F_GETFL, NULL);
 	if (flags < 0) {
@@ -977,6 +1252,112 @@ struct qmi_device *qmi_device_new(int fd)
 				received_data, device, read_watch_destroy);
 
 	g_io_channel_unref(device->io);
+
+	device->req_queue = g_queue_new();
+	device->control_queue = g_queue_new();
+	device->service_queue = g_queue_new();
+	device->discovery_queue = g_queue_new();
+
+	device->service_list = g_hash_table_new_full(g_direct_hash,
+					g_direct_equal, NULL, service_destroy);
+
+	device->next_control_tid = 1;
+	device->next_service_tid = 256;
+
+	return device;
+}
+
+static gboolean qrtr_receive(GSocket *socket,
+				     GIOCondition cond,
+				     struct qmi_device *device)
+{
+	struct qmi_mux_hdr *hdr;
+	g_autoptr(GSocketAddress) gaddr = NULL;
+	ssize_t bytes_recv;
+	struct sockaddr_qrtr addr;
+	char buf[2048];
+	GHashTableIter iter;
+	gpointer key, value;
+	bool found = false;
+
+	DBG ("");
+	bytes_recv = g_socket_receive_from (socket, &gaddr,
+					    buf + QMI_MUX_HDR_SIZE,
+					    sizeof(buf) - QMI_MUX_HDR_SIZE, NULL, NULL);
+
+	if (bytes_recv < 0)
+		return FALSE;
+
+	if (!g_socket_address_to_native (gaddr, &addr, sizeof(addr), NULL)) {
+		DBG ("Parse QRTR address failed");
+		return TRUE;
+	}
+
+	g_assert(addr.sq_family == AF_QIPCRTR);
+
+	DBG ("port %d node %d", addr.sq_port, addr.sq_node);
+
+	if (addr.sq_port == QRTR_PORT_CTRL) {
+		qrtr_handle_ctrl_packet(device, buf + QMI_MUX_HDR_SIZE, bytes_recv);
+		return TRUE;
+	}
+
+	if (bytes_recv < QMI_MUX_HDR_SIZE)
+		return TRUE;
+
+
+	hdr = (struct qmi_mux_hdr*) buf;
+	hdr->frame = 0x01;
+	hdr->length = GUINT16_TO_LE(bytes_recv - 1);
+	hdr->flags = 0x80;
+
+	__hexdump('<', (guchar *) buf, bytes_recv,
+	          device->debug_func, device->debug_data);
+
+	g_hash_table_iter_init (&iter, device->service_list);
+	while (g_hash_table_iter_next (&iter, &key, &value))
+	{
+		struct qmi_service *svc = value;
+		if (svc->port != addr.sq_port)
+			continue;
+
+		hdr->service = (uint8_t) svc->type;
+		hdr->client = svc->client_id;
+		found = true;
+		break;
+	}
+
+	if (!found)
+		return true;
+
+	handle_packet(device, hdr, buf + QMI_MUX_HDR_SIZE);
+	return true;
+}
+
+struct qmi_device *qmi_device_new_qrtr(int node)
+{
+	struct qmi_device *device;
+	DBG ("");
+
+	device = g_try_new0(struct qmi_device, 1);
+	if (!device)
+		return NULL;
+
+	__debug_device(device, "device %p new (QRTR)", device);
+
+	device->ref_count = 1;
+	device->fd = -1;
+	device->close_on_unref = false;
+	device->node_id = node;
+	device->next_cid = 1;
+
+	device->socket = qrtr_socket_create ((GSourceFunc) qrtr_receive,
+			device, &device->source);
+	if (!device->socket) {
+		DBG("Error creating qipcrtr socket");
+		g_free(device);
+		return NULL;
+	}
 
 	device->req_queue = g_queue_new();
 	device->control_queue = g_queue_new();
@@ -1279,7 +1660,9 @@ static gboolean discover_reply(gpointer user_data)
 		data->func(data->user_data);
 
 	__qmi_device_discovery_complete(data->device, &data->super);
-	__request_free(req, NULL);
+
+	if (req)
+		__request_free(req, NULL);
 
 	return FALSE;
 }
@@ -1312,6 +1695,15 @@ bool qmi_device_discover(struct qmi_device *device, qmi_discover_func_t func,
 		return true;
 	}
 
+	if (device->socket) {
+		if (!qrtr_send_lookup(device->socket))
+		{
+			g_free(data);
+			return false;
+		}
+		goto done;
+	}
+
 	req = __request_alloc(QMI_SERVICE_CONTROL, 0x00,
 			QMI_CTL_GET_VERSION_INFO,
 			NULL, 0, discover_callback, data);
@@ -1319,6 +1711,7 @@ bool qmi_device_discover(struct qmi_device *device, qmi_discover_func_t func,
 	tid = __request_submit(device, req);
 
 	data->tid = tid;
+done:
 
 	data->timeout = g_timeout_add_seconds(5, discover_reply, data);
 	__qmi_device_discovery_started(device, &data->super);
@@ -1332,6 +1725,9 @@ static void release_client(struct qmi_device *device,
 {
 	unsigned char release_req[] = { 0x01, 0x02, 0x00, type, client_id };
 	struct qmi_request *req;
+
+	if (device->socket)
+		return;
 
 	req = __request_alloc(QMI_SERVICE_CONTROL, 0x00,
 			QMI_CTL_RELEASE_CLIENT_ID,
@@ -1441,6 +1837,9 @@ bool qmi_device_sync(struct qmi_device *device,
 bool qmi_device_is_sync_supported(struct qmi_device *device)
 {
 	if (device == NULL)
+		return false;
+
+	if (device->socket)
 		return false;
 
 	return (device->control_major > 1 ||
@@ -2033,6 +2432,9 @@ static bool service_create(struct qmi_device *device,
 	unsigned char client_req[] = { 0x01, 0x01, 0x00, type };
 	struct qmi_request *req;
 	int i;
+
+	if (device->socket)
+		return qrtr_service_create(device, type, func, user_data, destroy);
 
 	data = g_try_new0(struct service_create_data, 1);
 	if (!data)

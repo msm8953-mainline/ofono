@@ -24,6 +24,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <gio/gio.h>
 
 #define QMI_SERVICE_CONTROL	0	/* Control service */
 #define QMI_SERVICE_WDS		1	/* Wireless data service */
@@ -77,6 +78,14 @@ typedef void (*qmi_shutdown_func_t)(void *user_data);
 typedef void (*qmi_discover_func_t)(void *user_data);
 
 struct qmi_device *qmi_device_new(int fd);
+struct qmi_device *qmi_device_new_qrtr(int node);
+bool qrtr_send_packet(GSocket *socket,
+			unsigned int node,
+			unsigned int port,
+			char *buf, size_t len);
+bool qrtr_send_lookup(GSocket *socket);
+GSocket* qrtr_socket_create(GSourceFunc input_callback,
+				void *userdata, GSource **source);
 
 struct qmi_device *qmi_device_ref(struct qmi_device *device);
 void qmi_device_unref(struct qmi_device *device);
