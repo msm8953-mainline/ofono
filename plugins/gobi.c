@@ -313,6 +313,25 @@ static void discover_cb(void *user_data)
 		create_shared_dms(modem);
 }
 
+static int gobi_qrtr_enable(struct ofono_modem *modem)
+{
+	struct gobi_data *data = ofono_modem_get_data(modem);
+	unsigned int node = ofono_modem_get_integer(modem, "QRTRNode");
+
+	data->device = qmi_device_new_qrtr(node);
+	if (!data->device)
+		return -ENOMEM;
+
+	if (getenv("OFONO_QMI_DEBUG"))
+		qmi_device_set_debug(data->device, gobi_debug, "QMI: ");
+
+	qmi_device_set_close_on_unref(data->device, true);
+
+	qmi_device_discover(data->device, discover_cb, modem, NULL);
+
+	return -EINPROGRESS;
+}
+
 static int gobi_enable(struct ofono_modem *modem)
 {
 	struct gobi_data *data = ofono_modem_get_data(modem);
@@ -320,6 +339,9 @@ static int gobi_enable(struct ofono_modem *modem)
 	int fd;
 
 	DBG("%p", modem);
+
+	if (ofono_modem_get_boolean(modem, "QRTRDevice"))
+		return gobi_qrtr_enable(modem);
 
 	device = ofono_modem_get_string(modem, "Device");
 	if (!device)
