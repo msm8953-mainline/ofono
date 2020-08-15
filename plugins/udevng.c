@@ -203,6 +203,16 @@ static gboolean setup_gobi(struct modem_info *modem)
 
 	DBG("%s", modem->syspath);
 
+	if (modem->type == MODEM_TYPE_SERIAL) {
+		if (strcmp(udev_device_get_driver(modem->serial->dev) ?: "",
+					"qcom_smd_qrtr"))
+			return FALSE;
+
+		ofono_modem_set_boolean(modem->modem, "QRTRDevice", TRUE);
+		ofono_modem_set_integer(modem->modem, "QRTRNode", 0);
+		return TRUE;
+	}
+
 	for (list = modem->devices; list; list = list->next) {
 		struct device_info *info = list->data;
 
@@ -2079,6 +2089,7 @@ static void enumerate_devices(struct udev *context)
 	udev_enumerate_add_match_subsystem(enumerate, "net");
 	udev_enumerate_add_match_subsystem(enumerate, "hsi");
 	udev_enumerate_add_match_subsystem(enumerate, "pci");
+	udev_enumerate_add_match_subsystem(enumerate, "rpmsg");
 
 	udev_enumerate_scan_devices(enumerate);
 

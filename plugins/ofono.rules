@@ -27,3 +27,6 @@ ATTRS{idVendor}=="0421", ATTRS{idProduct}=="023e", ENV{OFONO_DRIVER}="nokiacdma"
 ATTRS{idVendor}=="0421", ATTRS{idProduct}=="00b6", ENV{OFONO_DRIVER}="nokiacdma"
 
 LABEL="ofono_end"
+
+# QRTR-controlled embedded modem
+SUBSYSTEM=="rpmsg", DRIVER=="qcom_smd_qrtr", ATTRS{rpmsg_name}=="modem", ENV{OFONO_DRIVER}="gobi"
