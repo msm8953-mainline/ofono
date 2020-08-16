@@ -238,11 +238,16 @@ static void dial(struct ofono_voicecall *vc, const struct ofono_phone_number *ph
 	struct voicecall_data *vd = ofono_voicecall_get_data(vc);
 	struct cb_data *cbd = cb_data_new(cb, data);
 	struct qmi_voice_dial_call_arg arg;
+	char number[OFONO_MAX_PHONE_NUMBER_LENGTH + 1] = "+";
 
 	cbd->user = vc;
 	arg.calling_number_set = true;
 	arg.calling_number = ph->number;
 	memcpy(&vd->dialed, ph, sizeof(*ph));
+
+	if (ph->type == OFONO_NUMBER_TYPE_INTERNATIONAL)
+		arg.calling_number = strncat(number,
+				ph->number, OFONO_MAX_PHONE_NUMBER_LENGTH - 1);
 
 	arg.call_type_set = true;
 	arg.call_type = QMI_CALL_TYPE_VOICE_FORCE;
