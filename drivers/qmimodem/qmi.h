@@ -55,6 +55,7 @@
 #define QMI_SERVICE_RFRPE	41
 #define QMI_SERVICE_DSD		42
 #define QMI_SERVICE_SSCTL	43
+#define QMI_SERVICE_DPM		47	/* Data Port Mapper */
 #define QMI_SERVICE_CAT_OLD	224	/* Card application toolkit service */
 #define QMI_SERVICE_RMS		225	/* Remote management service */
 #define QMI_SERVICE_OMA		226	/* OMA device management service */

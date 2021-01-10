@@ -39,6 +39,7 @@
 struct gprs_context_data {
 	struct qmi_service *wds;
 	struct qmi_service *wda;
+	struct qmi_service *dpm;
 	struct qmi_device *dev;
 	unsigned int active_context;
 	uint32_t pkt_handle;
@@ -371,10 +372,59 @@ static void qmi_gprs_context_detach_shutdown(struct ofono_gprs_context *gc,
 	qmi_deactivate_primary(gc, cid, NULL, NULL);
 }
 
+static const unsigned char dpm_open_params[] = {
+	0x01,
+	0x04, 0x00, 0x00, 0x00,
+	0x01, 0x00, 0x00, 0x00,
+	0x04, 0x00, 0x00, 0x00,
+	0x05, 0x00, 0x00, 0x00,
+};
+
+
+static void wds_bmdp_cb(struct qmi_result *result, void *user_data)
+{
+	uint16_t error;
+
+	DBG("");
+
+	if (qmi_result_set_error(result, &error)) {
+		DBG("Request failed:%d", error);
+	}
+}
+
+static void dpm_open_cb(struct qmi_result *result, void *user_data)
+{
+	struct ofono_gprs_context *gc = user_data;
+	struct gprs_context_data *data = ofono_gprs_context_get_data(gc);
+	struct qmi_param *param;
+	struct qmi_wds_ep_info ep_info = { .ep_type = 4, .iface_num = 1 };
+	uint16_t error;
+
+	DBG("");
+
+	if (qmi_result_set_error(result, &error)) {
+		DBG("Request failed:%d", error);
+		return;
+	}
+
+	param = qmi_param_new();
+	if (!param)
+		return;
+
+	qmi_param_append(param, QMI_WDS_PARAM_EP_INFO, sizeof(ep_info), &ep_info);
+	qmi_param_append_uint8(param, QMI_WDS_PARAM_MUX_ID, 1);
+
+	if (!qmi_service_send(data->wds, QMI_WDS_BIND_MUX_DATA_PORT, param,
+					wds_bmdp_cb, gc, NULL))
+		qmi_param_free(param);
+}
+
+
 static void create_wds_cb(struct qmi_service *service, void *user_data)
 {
 	struct ofono_gprs_context *gc = user_data;
 	struct gprs_context_data *data = ofono_gprs_context_get_data(gc);
+	struct qmi_param *param;
 
 	DBG("");
 
@@ -386,8 +436,39 @@ static void create_wds_cb(struct qmi_service *service, void *user_data)
 
 	data->wds = qmi_service_ref(service);
 
+	param = qmi_param_new();
+	if (!param)
+		goto error;
+
+	qmi_param_append(param, 0x11, sizeof(dpm_open_params),
+			dpm_open_params);
+
+	if (!qmi_service_send(data->dpm, 0x20, param,
+					dpm_open_cb, gc, NULL))
+		qmi_param_free(param);
+
+error:
 	qmi_service_register(data->wds, QMI_WDS_PKT_STATUS_IND,
 					pkt_status_notify, gc, NULL);
+}
+
+static void create_dpm_cb(struct qmi_service *service, void *user_data)
+{
+	struct ofono_gprs_context *gc = user_data;
+	struct gprs_context_data *data = ofono_gprs_context_get_data(gc);
+
+	DBG("");
+
+	if (!service) {
+		DBG("Failed to request DPM service, continue initialization");
+		goto error;
+	}
+
+	data->dpm = qmi_service_ref(service);
+
+error:
+	qmi_service_create_shared(data->dev, QMI_SERVICE_WDS, create_wds_cb, gc,
+									NULL);
 }
 
 static void get_data_format_cb(struct qmi_result *result, void *user_data)
@@ -426,7 +507,7 @@ static void get_data_format_cb(struct qmi_result *result, void *user_data)
 	}
 
 done:
-	qmi_service_create_shared(data->dev, QMI_SERVICE_WDS, create_wds_cb, gc,
+	qmi_service_create_shared(data->dev, QMI_SERVICE_DPM, create_dpm_cb, gc,
 									NULL);
 }
 
@@ -449,7 +530,7 @@ static void create_wda_cb(struct qmi_service *service, void *user_data)
 		return;
 
 error:
-	qmi_service_create_shared(data->dev, QMI_SERVICE_WDS, create_wds_cb, gc,
+	qmi_service_create_shared(data->dev, QMI_SERVICE_DPM, create_dpm_cb, gc,
 									NULL);
 }
 

@@ -26,6 +26,16 @@
 
 #define QMI_WDS_GET_SETTINGS	45	/* Get the runtime data session settings */
 
+#define QMI_WDS_BIND_MUX_DATA_PORT	162
+struct qmi_wds_ep_info {
+	uint32_t ep_type;
+	uint32_t iface_num;
+} __attribute__((__packed__));
+#define QMI_WDS_PARAM_EP_INFO			0x10	/* struct qmi_wds_ep_info */
+#define QMI_WDS_PARAM_MUX_ID			0x11	/* uint8 */
+#define QMI_WDS_PARAM_CLIENT_TYPE		0x13	/* uint32 */
+
+#define QMI_WDS_PARAM_IP_FAMILY			0x19	/* uint8 */
 
 /* Start WDS network interface */
 #define QMI_WDS_PARAM_APN			0x14	/* string */
